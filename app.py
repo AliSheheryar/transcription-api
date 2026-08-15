@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import threading
 import time
@@ -6,10 +7,29 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 app = FastAPI(title="Transcription API")
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_api_key(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> None:
+    """Validate Bearer token against API_KEY env var.
+
+    If API_KEY is unset, auth is disabled (dev mode). Set it in production.
+    """
+    expected = os.environ.get("API_KEY")
+    if not expected:
+        return
+    if creds is None or creds.scheme.lower() != "bearer":
+        raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
+    if not hmac.compare_digest(creds.credentials, expected):
+        raise HTTPException(401, "invalid api key", headers={"WWW-Authenticate": "Bearer"})
 
 JOBS: dict[str, dict] = {}
 IDEMPOTENCY: dict[str, str] = {}
@@ -70,7 +90,7 @@ def _process(job_id: str, audio_path: Path) -> None:
             JOBS[job_id]["error"] = {"code": type(e).__name__, "message": str(e), "retryable": True}
 
 
-@app.post("/v1/transcriptions", status_code=202)
+@app.post("/v1/transcriptions", status_code=202, dependencies=[Depends(require_api_key)])
 async def submit(
     file: UploadFile = File(...),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
@@ -104,7 +124,7 @@ async def submit(
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.get("/v1/transcriptions/{job_id}")
+@app.get("/v1/transcriptions/{job_id}", dependencies=[Depends(require_api_key)])
 def poll(job_id: str):
     with LOCK:
         job = JOBS.get(job_id)
@@ -116,7 +136,7 @@ def poll(job_id: str):
     return resp
 
 
-@app.get("/v1/transcriptions/{job_id}/transcript")
+@app.get("/v1/transcriptions/{job_id}/transcript", dependencies=[Depends(require_api_key)])
 def fetch(job_id: str):
     with LOCK:
         job = JOBS.get(job_id)

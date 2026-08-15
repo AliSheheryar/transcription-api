@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import io
+import os
 import sys
 import time
 import wave
@@ -19,6 +20,11 @@ import wave
 import httpx
 import numpy as np
 import sounddevice as sd
+
+
+def _auth_headers() -> dict:
+    key = os.environ.get("API_KEY")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 SAMPLE_RATE = 16_000  # Whisper is happy with 16 kHz mono
@@ -44,6 +50,7 @@ def submit(api: str, wav_bytes: bytes) -> str:
     r = httpx.post(
         f"{api}/v1/transcriptions",
         files={"file": ("mic.wav", wav_bytes, "audio/wav")},
+        headers=_auth_headers(),
         timeout=60.0,
     )
     r.raise_for_status()
@@ -56,7 +63,7 @@ def poll_until_done(api: str, job_id: str, timeout_s: float = 300.0) -> None:
     deadline = time.time() + timeout_s
     last = None
     while time.time() < deadline:
-        r = httpx.get(f"{api}/v1/transcriptions/{job_id}", timeout=10.0)
+        r = httpx.get(f"{api}/v1/transcriptions/{job_id}", headers=_auth_headers(), timeout=10.0)
         r.raise_for_status()
         body = r.json()
         if body["status"] != last:
@@ -71,7 +78,7 @@ def poll_until_done(api: str, job_id: str, timeout_s: float = 300.0) -> None:
 
 
 def fetch(api: str, job_id: str) -> None:
-    r = httpx.get(f"{api}/v1/transcriptions/{job_id}/transcript", timeout=10.0)
+    r = httpx.get(f"{api}/v1/transcriptions/{job_id}/transcript", headers=_auth_headers(), timeout=10.0)
     r.raise_for_status()
     segments = r.json().get("segments", [])
     print("\n--- Transcript ---")

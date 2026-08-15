@@ -106,6 +106,38 @@ def test_content_hash_dedup_without_key():
     assert r1.json()["job_id"] == r2.json()["job_id"]
 
 
+def test_auth_disabled_when_no_env(monkeypatch):
+    monkeypatch.delenv("API_KEY", raising=False)
+    r = client.post("/v1/transcriptions", files={"file": ("a.mp3", b"noauth", "audio/mpeg")})
+    assert r.status_code == 202
+
+
+def test_auth_requires_bearer_when_key_set(monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    r = client.post("/v1/transcriptions", files={"file": ("a.mp3", b"x1", "audio/mpeg")})
+    assert r.status_code == 401
+
+
+def test_auth_rejects_wrong_key(monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    r = client.post(
+        "/v1/transcriptions",
+        files={"file": ("a.mp3", b"x2", "audio/mpeg")},
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert r.status_code == 401
+
+
+def test_auth_accepts_correct_key(monkeypatch):
+    monkeypatch.setenv("API_KEY", "s3cret")
+    r = client.post(
+        "/v1/transcriptions",
+        files={"file": ("a.mp3", b"x3", "audio/mpeg")},
+        headers={"Authorization": "Bearer s3cret"},
+    )
+    assert r.status_code == 202
+
+
 def test_concurrent_submits_collapse_to_one_job():
     payload = b"race-" + uuid.uuid4().hex.encode()
     key = "race-key-" + uuid.uuid4().hex

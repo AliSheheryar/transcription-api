@@ -63,7 +63,25 @@ uvicorn app:app --reload
 uvicorn app:app --reload
 ```
 
-Optional: `WHISPER_MODEL` (default `whisper-1`).
+Optional: `WHISPER_MODEL` (default `whisper-1`), `API_KEY` (enables auth — see below).
+
+## Authentication
+
+Set `API_KEY` to require a Bearer token on every endpoint:
+
+```powershell
+$env:API_KEY = "your-long-random-secret"
+uvicorn app:app
+```
+
+Clients send it in the `Authorization` header:
+
+```bash
+curl -H "Authorization: Bearer your-long-random-secret" \
+     -F file=@meeting.mp3 http://localhost:8000/v1/transcriptions
+```
+
+Without `API_KEY` set, auth is **disabled** (dev/test mode). Missing/wrong keys return `401 Unauthorized`. Comparison uses `hmac.compare_digest` (constant-time) to prevent timing attacks.
 
 ## Endpoints
 
@@ -122,3 +140,7 @@ pytest -v
 | `test_fetch_before_done_returns_409` | Fetching before processing finishes returns `409` with the current status — never a partial or fake transcript |
 | `test_content_hash_dedup_without_key` | Two submits of identical bytes with no `Idempotency-Key` collapse to one job via content hash |
 | `test_concurrent_submits_collapse_to_one_job` | 5 threads racing the same `Idempotency-Key` produce exactly one job — the `LOCK` around the dedup table holds under contention |
+| `test_auth_disabled_when_no_env` | No `API_KEY` set → all requests accepted (dev mode) |
+| `test_auth_requires_bearer_when_key_set` | `API_KEY` set + missing Authorization header → `401` |
+| `test_auth_rejects_wrong_key` | Wrong bearer token → `401` |
+| `test_auth_accepts_correct_key` | Correct bearer token → `202` |
