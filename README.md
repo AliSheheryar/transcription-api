@@ -42,6 +42,22 @@ curl http://localhost:8000/v1/transcriptions/abc.../transcript
 # → { "segments": [ ... ] }
 ```
 
+## Record from your mic → transcribe end-to-end
+
+Real-mic demo. Requires `OPENAI_API_KEY` (mock mode also works, you'll just get a fake transcript).
+
+```powershell
+# Terminal 1 — start the API with your key
+$env:OPENAI_API_KEY = "sk-..."
+uvicorn app:app
+
+# Terminal 2 — record 5s from default mic, upload, poll, print
+python record_and_transcribe.py                 # 5s default
+python record_and_transcribe.py --seconds 15    # longer clip
+```
+
+The script records 16 kHz mono WAV, POSTs it to `/v1/transcriptions`, polls until `done`, and prints timestamped segments.
+
 ## Test
 
 ```bash
