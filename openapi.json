@@ -1,0 +1,478 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Transcription API",
+    "description": "\nAsync audio transcription API. Three endpoints \u2014 **submit**, **poll**, **fetch** \u2014\nform a durable job pipeline over OpenAI Whisper (or a mock in dev mode).\n\n## Flow\n\n1. `POST /v1/transcriptions` with an audio file \u2192 `202 { job_id, status: \"queued\" }`.\n2. `GET /v1/transcriptions/{job_id}` \u2014 poll until `status == \"done\"` or `\"failed\"`.\n3. `GET /v1/transcriptions/{job_id}/transcript` \u2014 retrieve `{ segments: [{start, end, text}] }`.\n\n## Auth\n\nSet the `API_KEY` env var on the server to require `Authorization: Bearer <key>`\non every request. When unset, auth is disabled (dev mode).\n\n## Idempotency\n\nInclude an `Idempotency-Key` header on submit; a retried submit with the same\nkey returns the same `job_id`. Without a header, the SHA-256 of the audio bytes\nis used as an implicit key.\n",
+    "contact": {
+      "name": "AliSheheryar",
+      "url": "https://github.com/AliSheheryar/transcription-api"
+    },
+    "license": {
+      "name": "MIT"
+    },
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/v1/transcriptions": {
+      "post": {
+        "tags": [
+          "transcriptions"
+        ],
+        "summary": "Submit an audio file for transcription.",
+        "description": "Accepts an audio file, enqueues a transcription job, returns `202` with a `job_id`.\n\nDoes not block on transcription. Use the poll endpoint to check status.",
+        "operationId": "submit_v1_transcriptions_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional client-supplied dedup key; retries with the same key return the same job_id.",
+              "title": "Idempotency-Key"
+            },
+            "description": "Optional client-supplied dedup key; retries with the same key return the same job_id."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_submit_v1_transcriptions_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubmitResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unsupported audio format.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/transcriptions/{job_id}": {
+      "get": {
+        "tags": [
+          "transcriptions"
+        ],
+        "summary": "Poll job status.",
+        "description": "Returns current `status` (queued | processing | done | failed).\n\nOn `failed`, includes an `error` object with `code`, `message`, and `retryable`.",
+        "operationId": "poll_v1_transcriptions__job_id__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown job_id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/transcriptions/{job_id}/transcript": {
+      "get": {
+        "tags": [
+          "transcriptions"
+        ],
+        "summary": "Fetch the finished transcript.",
+        "description": "Returns `{ segments: [{start, end, text}] }` once the job is `done`.\n\nReturns `409 Conflict` with `{status}` if called before completion \u2014 never a\npartial or fabricated transcript.",
+        "operationId": "fetch_v1_transcriptions__job_id__transcript_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown job_id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Job is not yet `done`; response body carries the current status."
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Body_submit_v1_transcriptions_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "description": "Audio file (mp3, wav, m4a, flac, ogg, opus, webm, ...)."
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_submit_v1_transcriptions_post"
+      },
+      "HTTPError": {
+        "properties": {
+          "detail": {
+            "type": "string",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "title": "HTTPError"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "JobError": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code",
+            "description": "Exception class name from the worker.",
+            "examples": [
+              "RateLimitError"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable error message."
+          },
+          "retryable": {
+            "type": "boolean",
+            "title": "Retryable",
+            "description": "True if a resubmit is likely to succeed."
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "title": "JobError"
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "processing",
+          "done",
+          "failed"
+        ],
+        "title": "JobStatus"
+      },
+      "JobStatusResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only when `status == \"failed\"`."
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "title": "JobStatusResponse"
+      },
+      "Segment": {
+        "properties": {
+          "start": {
+            "type": "number",
+            "title": "Start",
+            "description": "Segment start time (seconds).",
+            "examples": [
+              0.0
+            ]
+          },
+          "end": {
+            "type": "number",
+            "title": "End",
+            "description": "Segment end time (seconds).",
+            "examples": [
+              1.5
+            ]
+          },
+          "text": {
+            "type": "string",
+            "title": "Text",
+            "description": "Transcribed text for this segment."
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "text"
+        ],
+        "title": "Segment"
+      },
+      "SubmitResponse": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "title": "Job Id",
+            "description": "Opaque job identifier.",
+            "examples": [
+              "8f2d1c74-..."
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "Initial status; usually `queued`."
+          }
+        },
+        "type": "object",
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "title": "SubmitResponse"
+      },
+      "TranscriptResponse": {
+        "properties": {
+          "segments": {
+            "items": {
+              "$ref": "#/components/schemas/Segment"
+            },
+            "type": "array",
+            "title": "Segments"
+          }
+        },
+        "type": "object",
+        "required": [
+          "segments"
+        ],
+        "title": "TranscriptResponse"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "description": "Bearer token; value of the server's API_KEY env var.",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "transcriptions",
+      "description": "Submit, poll, and fetch transcription jobs."
+    }
+  ]
+}

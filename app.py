@@ -4,25 +4,57 @@ import os
 import threading
 import time
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Transcription API")
+API_DESCRIPTION = """
+Async audio transcription API. Three endpoints — **submit**, **poll**, **fetch** —
+form a durable job pipeline over OpenAI Whisper (or a mock in dev mode).
 
-bearer_scheme = HTTPBearer(auto_error=False)
+## Flow
+
+1. `POST /v1/transcriptions` with an audio file → `202 { job_id, status: "queued" }`.
+2. `GET /v1/transcriptions/{job_id}` — poll until `status == "done"` or `"failed"`.
+3. `GET /v1/transcriptions/{job_id}/transcript` — retrieve `{ segments: [{start, end, text}] }`.
+
+## Auth
+
+Set the `API_KEY` env var on the server to require `Authorization: Bearer <key>`
+on every request. When unset, auth is disabled (dev mode).
+
+## Idempotency
+
+Include an `Idempotency-Key` header on submit; a retried submit with the same
+key returns the same `job_id`. Without a header, the SHA-256 of the audio bytes
+is used as an implicit key.
+"""
+
+tags_metadata = [
+    {"name": "transcriptions", "description": "Submit, poll, and fetch transcription jobs."},
+]
+
+app = FastAPI(
+    title="Transcription API",
+    version="1.0.0",
+    description=API_DESCRIPTION,
+    openapi_tags=tags_metadata,
+    contact={"name": "AliSheheryar", "url": "https://github.com/AliSheheryar/transcription-api"},
+    license_info={"name": "MIT"},
+)
+
+bearer_scheme = HTTPBearer(auto_error=False, description="Bearer token; value of the server's API_KEY env var.")
 
 
 def require_api_key(
     creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> None:
-    """Validate Bearer token against API_KEY env var.
-
-    If API_KEY is unset, auth is disabled (dev mode). Set it in production.
-    """
+    """Validate Bearer token against API_KEY env var. If unset, auth is disabled."""
     expected = os.environ.get("API_KEY")
     if not expected:
         return
@@ -30,6 +62,7 @@ def require_api_key(
         raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
     if not hmac.compare_digest(creds.credentials, expected):
         raise HTTPException(401, "invalid api key", headers={"WWW-Authenticate": "Bearer"})
+
 
 JOBS: dict[str, dict] = {}
 IDEMPOTENCY: dict[str, str] = {}
@@ -44,6 +77,48 @@ AUDIO_EXTS = {
 }
 AUDIO_MIME_PREFIXES = ("audio/", "video/mp4", "video/webm")
 
+
+# ---------- Schemas (drive OpenAPI + client SDK types) ----------
+
+class JobStatus(str, Enum):
+    queued = "queued"
+    processing = "processing"
+    done = "done"
+    failed = "failed"
+
+
+class SubmitResponse(BaseModel):
+    job_id: str = Field(..., description="Opaque job identifier.", examples=["8f2d1c74-..."])
+    status: JobStatus = Field(..., description="Initial status; usually `queued`.")
+
+
+class JobError(BaseModel):
+    code: str = Field(..., description="Exception class name from the worker.", examples=["RateLimitError"])
+    message: str = Field(..., description="Human-readable error message.")
+    retryable: bool = Field(..., description="True if a resubmit is likely to succeed.")
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    error: Optional[JobError] = Field(None, description="Present only when `status == \"failed\"`.")
+
+
+class Segment(BaseModel):
+    start: float = Field(..., description="Segment start time (seconds).", examples=[0.0])
+    end: float = Field(..., description="Segment end time (seconds).", examples=[1.5])
+    text: str = Field(..., description="Transcribed text for this segment.")
+
+
+class TranscriptResponse(BaseModel):
+    segments: list[Segment]
+
+
+class HTTPError(BaseModel):
+    detail: str
+
+
+# ---------- Transcribers ----------
 
 def _transcribe_whisper(audio_path: Path) -> list[dict]:
     """Call OpenAI Whisper API. Requires OPENAI_API_KEY."""
@@ -90,20 +165,38 @@ def _process(job_id: str, audio_path: Path) -> None:
             JOBS[job_id]["error"] = {"code": type(e).__name__, "message": str(e), "retryable": True}
 
 
-@app.post("/v1/transcriptions", status_code=202, dependencies=[Depends(require_api_key)])
+# ---------- Endpoints ----------
+
+@app.post(
+    "/v1/transcriptions",
+    status_code=202,
+    response_model=SubmitResponse,
+    responses={
+        400: {"model": HTTPError, "description": "Unsupported audio format."},
+        401: {"model": HTTPError, "description": "Missing or invalid API key."},
+    },
+    tags=["transcriptions"],
+    summary="Submit an audio file for transcription.",
+    dependencies=[Depends(require_api_key)],
+)
 async def submit(
-    file: UploadFile = File(...),
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    file: UploadFile = File(..., description="Audio file (mp3, wav, m4a, flac, ogg, opus, webm, ...)."),
+    idempotency_key: Optional[str] = Header(
+        None,
+        alias="Idempotency-Key",
+        description="Optional client-supplied dedup key; retries with the same key return the same job_id.",
+    ),
 ):
+    """Accepts an audio file, enqueues a transcription job, returns `202` with a `job_id`.
+
+    Does not block on transcription. Use the poll endpoint to check status.
+    """
     ext = Path(file.filename or "").suffix.lower()
     mime = (file.content_type or "").lower()
     ext_ok = ext in AUDIO_EXTS
     mime_ok = any(mime.startswith(p) for p in AUDIO_MIME_PREFIXES)
     if not (ext_ok or mime_ok):
-        raise HTTPException(
-            400,
-            f"Unsupported audio format (ext='{ext}', mime='{mime}')",
-        )
+        raise HTTPException(400, f"Unsupported audio format (ext='{ext}', mime='{mime}')")
 
     data = await file.read()
     key = idempotency_key or hashlib.sha256(data).hexdigest()
@@ -124,20 +217,50 @@ async def submit(
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.get("/v1/transcriptions/{job_id}", dependencies=[Depends(require_api_key)])
+@app.get(
+    "/v1/transcriptions/{job_id}",
+    response_model=JobStatusResponse,
+    responses={
+        401: {"model": HTTPError, "description": "Missing or invalid API key."},
+        404: {"model": HTTPError, "description": "Unknown job_id."},
+    },
+    tags=["transcriptions"],
+    summary="Poll job status.",
+    dependencies=[Depends(require_api_key)],
+)
 def poll(job_id: str):
+    """Returns current `status` (queued | processing | done | failed).
+
+    On `failed`, includes an `error` object with `code`, `message`, and `retryable`.
+    """
     with LOCK:
         job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     resp = {"job_id": job_id, "status": job["status"]}
     if job["status"] == "failed":
-        resp["error"] = job.get("error", {"code": "processing_error", "retryable": True})
+        resp["error"] = job.get("error", {"code": "processing_error", "message": "unknown", "retryable": True})
     return resp
 
 
-@app.get("/v1/transcriptions/{job_id}/transcript", dependencies=[Depends(require_api_key)])
+@app.get(
+    "/v1/transcriptions/{job_id}/transcript",
+    response_model=TranscriptResponse,
+    responses={
+        401: {"model": HTTPError, "description": "Missing or invalid API key."},
+        404: {"model": HTTPError, "description": "Unknown job_id."},
+        409: {"description": "Job is not yet `done`; response body carries the current status."},
+    },
+    tags=["transcriptions"],
+    summary="Fetch the finished transcript.",
+    dependencies=[Depends(require_api_key)],
+)
 def fetch(job_id: str):
+    """Returns `{ segments: [{start, end, text}] }` once the job is `done`.
+
+    Returns `409 Conflict` with `{status}` if called before completion — never a
+    partial or fabricated transcript.
+    """
     with LOCK:
         job = JOBS.get(job_id)
     if not job:
