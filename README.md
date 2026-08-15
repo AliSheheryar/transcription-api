@@ -1,180 +1,146 @@
 # Transcription API
 
-Async audio transcription API with submit / poll / fetch endpoints. Accepts any common audio format (mp3, wav, m4a, flac, ogg, opus, webm, aac, wma, aiff, amr, 3gp, mka). Uses OpenAI Whisper when `OPENAI_API_KEY` is set, otherwise returns a mock transcript so tests and local dev work without an API key.
+Async, multi-user audio transcription API. Postgres for state, Redis for rate limiting + idempotency, Kafka for the job queue, worker as a separate process. Falls back to an in-memory mode for CI/dev without any infrastructure.
 
-## Design
-
-**Approach.** The naive `POST /transcribe → wait → return text` breaks the moment transcription takes more than a few seconds: clients time out, retries duplicate work, crashes lose jobs. So it's **async**: submit returns immediately, work happens in the background, client polls.
-
-**Key decisions.**
-1. **Three endpoints, not one** — submit / poll / fetch. Poll stays cheap (tiny status blob); fetch ships the full transcript only once.
-2. **State machine in durable storage** — `queued → processing → done | failed`. Every component reads the same row; nothing calls anything else directly.
-3. **Idempotency-Key + content-hash fallback** — retries collapse to one job, so a flaky network never double-charges.
-4. **Failures written into the job row** — worker exception becomes `{code, message, retryable}` on the next poll; nothing disappears silently.
-5. **Whisper swappable behind one function** — real call when `OPENAI_API_KEY` is set, mock otherwise. Tests + local dev need no key.
-6. **Format check is loose** — extension OR `audio/*` mime. Whisper decides if the bytes are actually audio.
-
-**End-to-end flow.**
+## Architecture
 
 ```
-CLIENT                     API                           WORKER                    STORAGE
-  │                         │                              │                          │
-  │  POST audio ──────────▶ │                              │                          │
-  │                         │ validate format (400 if bad) │                          │
-  │                         │ compute idempotency key      │                          │
-  │                         │ ┌─ LOCK ─────────────────┐   │                          │
-  │                         │ │ key seen? → return id  │   │                          │
-  │                         │ │ else: mint UUID,       │   │                          │
-  │                         │ │   write audio blob ────┼──────────────────────────▶  │
-  │                         │ │   JOBS[id]=queued      │   │                          │
-  │                         │ └────────────────────────┘   │                          │
-  │                         │ start background thread ────▶│                          │
-  │ ◀── 202 { job_id } ─────│                              │ status: processing       │
-  │                         │                              │ read audio ◀────────────│
-  │                         │                              │ call Whisper (or mock)   │
-  │                         │                              │ write transcript.json ──▶│
-  │                         │                              │ status: done             │
-  │                         │                              │ (on error → failed +     │
-  │                         │                              │  {code, msg, retryable}) │
-  │  GET /{id} ───────────▶ │ read JOBS[id] under lock     │                          │
-  │ ◀── {status} ───────────│                              │                          │
-  │        ...poll...       │                              │                          │
-  │  GET /{id}/transcript ▶ │ if not done → 409            │                          │
-  │                         │ else read blob ◀─────────────────────────────────────── │
-  │ ◀── { segments } ───────│                              │                          │
+┌───────┐   POST audio        ┌──────────┐   produce         ┌─────────┐
+│Client │ ───────────────────▶│ FastAPI  │──────────────────▶│ Kafka   │
+│       │                     │  (API)   │                    │(topic:  │
+│       │ ◀── 202 {job_id} ───│          │                    │submits) │
+└───────┘                     │          │                    └────┬────┘
+                              │   auth ─▶│ Postgres:                │
+                              │   rate ─▶│  users, api_keys, jobs   │ consume
+                              │   idem ─▶│ Redis: rl + idempotency  ▼
+                              └──────────┘                    ┌──────────┐
+     GET status/transcript                                    │  Worker  │
+       ───────────────────────────────────────────────────────│(consumer)│
+                                                              │→ Whisper │
+                                                              │→ update  │
+                                                              │  Postgres│
+                                                              └──────────┘
 ```
 
-**The one principle.** Every layer talks only through the job row. That's what lets the dict become Postgres, the thread become a queue, and the local file become S3 — with the endpoints unchanged.
+## Modes
 
-## Install
+| Mode | When | State | Queue | Rate limit |
+|---|---|---|---|---|
+| **In-memory** (default without `DATABASE_URL`, or `INMEMORY=1`) | Tests, local dev | Python dict | Thread | None |
+| **Production** (`DATABASE_URL` set) | Everything else | Postgres | Kafka | Redis |
+
+The public HTTP API is identical in both modes.
+
+## Quick start (production stack)
 
 ```bash
+# 1. Bring up Postgres, Redis, Kafka
+docker compose up -d
+
+# 2. Install deps
 pip install -r requirements.txt
+
+# 3. Configure
+$env:DATABASE_URL   = "postgresql://tx:tx@localhost:5432/transcription"
+$env:REDIS_URL      = "redis://localhost:6379/0"
+$env:KAFKA_BOOTSTRAP = "localhost:9092"
+$env:OPENAI_API_KEY = "sk-..."   # optional; omit to use mock transcriber
+
+# 4. Seed a user + API key (prints the plaintext key once — save it)
+python seed.py you@example.com --plan free
+
+# 5. Run API + worker (separate terminals)
+uvicorn app:app
+python worker.py
+
+# 6. Call it
+curl -H "Authorization: Bearer tk_..." -F file=@audio.mp3 http://localhost:8000/v1/transcriptions
 ```
 
-## Run
-
-```bash
-# Real transcription
-export OPENAI_API_KEY=sk-...        # PowerShell: $env:OPENAI_API_KEY="sk-..."
-uvicorn app:app --reload
-
-# Mock mode (no key)
-uvicorn app:app --reload
-```
-
-Optional: `WHISPER_MODEL` (default `whisper-1`), `API_KEY` (enables auth — see below).
-
-## Interactive docs & OpenAPI
-
-FastAPI generates a full OpenAPI 3.1 spec from the endpoint signatures — no separate spec file to maintain by hand.
-
-| URL | What you get |
-|---|---|
-| `http://localhost:8000/docs` | **Swagger UI** — interactive sandbox, "Try it out" per endpoint, auth button, request/response examples |
-| `http://localhost:8000/redoc` | **ReDoc** — clean reference-style docs, ideal for public API portals |
-| `http://localhost:8000/openapi.json` | Raw spec — feed to Postman, Insomnia, or any SDK generator |
-
-The committed [`openapi.json`](openapi.json) is regenerated by:
-
-```bash
-python export_openapi.py
-```
-
-### Generate a client SDK
-
-The spec is compatible with [`openapi-generator`](https://openapi-generator.tech) — one command produces a typed client in any language:
-
-```bash
-# TypeScript / Node
-npx @openapitools/openapi-generator-cli generate \
-  -i openapi.json -g typescript-axios -o clients/ts
-
-# Python
-openapi-generator-cli generate -i openapi.json -g python -o clients/python
-
-# Go
-openapi-generator-cli generate -i openapi.json -g go -o clients/go
-```
-
-Every response model (`SubmitResponse`, `JobStatusResponse`, `TranscriptResponse`, `JobError`, `Segment`) is defined as a Pydantic `BaseModel` in [`app.py`](app.py), so generated SDKs get full typing and IDE autocomplete out of the box.
-
-## Authentication
-
-Set `API_KEY` to require a Bearer token on every endpoint:
+## Quick start (in-memory, no infra)
 
 ```powershell
-$env:API_KEY = "your-long-random-secret"
-uvicorn app:app
+pip install -r requirements.txt
+uvicorn app:app                    # DATABASE_URL unset → in-memory mode
+python record_and_transcribe.py    # end-to-end mic → transcript
 ```
-
-Clients send it in the `Authorization` header:
-
-```bash
-curl -H "Authorization: Bearer your-long-random-secret" \
-     -F file=@meeting.mp3 http://localhost:8000/v1/transcriptions
-```
-
-Without `API_KEY` set, auth is **disabled** (dev/test mode). Missing/wrong keys return `401 Unauthorized`. Comparison uses `hmac.compare_digest` (constant-time) to prevent timing attacks.
 
 ## Endpoints
 
 | Verb | Path | Success | Notes |
 |---|---|---|---|
-| POST | `/v1/transcriptions` | `202 { job_id, status }` | multipart `file`; optional `Idempotency-Key` header |
-| GET  | `/v1/transcriptions/{id}` | `200 { status }` | `queued \| processing \| done \| failed`; failed jobs include `error: { code, message, retryable }` |
-| GET  | `/v1/transcriptions/{id}/transcript` | `200 { segments: [{start, end, text}] }` | `409` if not yet `done`, `404` if unknown id |
+| POST | `/v1/transcriptions` | `202 { job_id, status }` | multipart `file`; `Idempotency-Key` header optional |
+| GET  | `/v1/transcriptions/{id}` | `200 { status, error? }` | `queued \| processing \| done \| failed` |
+| GET  | `/v1/transcriptions/{id}/transcript` | `200 { segments }` | `409` if not done; `404` if unknown/not yours |
 
-## Example
+## Authentication
 
-```bash
-curl -F file=@meeting.m4a http://localhost:8000/v1/transcriptions
-# → { "job_id": "abc...", "status": "queued" }
+**Production mode:** per-user API keys generated by `seed.py`, stored hashed in Postgres. Client sends `Authorization: Bearer tk_<key>`. Middleware looks up the SHA-256 hash, attaches the user to the request; every job is scoped by `user_id` (poll/fetch return `404` for other users' jobs).
 
-curl http://localhost:8000/v1/transcriptions/abc...
-# → { "status": "done" }
+**In-memory mode:** optional shared `API_KEY` env var (Bearer). If unset, auth is disabled — for tests only.
 
-curl http://localhost:8000/v1/transcriptions/abc.../transcript
-# → { "segments": [ ... ] }
+Both paths use `hmac.compare_digest` (constant-time) to prevent timing attacks.
+
+## Rate limiting
+
+Per-user, per-endpoint, sliding-window counter in Redis (Lua-scripted, atomic). Plans defined in [`ratelimit.py`](ratelimit.py):
+
+| Plan | Submit | Poll | Fetch |
+|---|---|---|---|
+| `free` | 60/min | 300/min | 60/min |
+| `pro` | 600/min | 3000/min | 600/min |
+
+Over-limit responses:
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 60
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 0
 ```
 
-## Record from your mic → transcribe end-to-end
+## Idempotency
 
-Real-mic demo. Requires `OPENAI_API_KEY` (mock mode also works, you'll just get a fake transcript).
+- **Header:** `Idempotency-Key: <any string>` — same key from the same user returns the same job.
+- **Fallback:** SHA-256 of the audio bytes, per-user — protects clients that don't cooperate.
+- **Storage:** Redis `SET NX EX 86400` (atomic get-or-set) in production; in-memory dict in dev.
 
-```powershell
-# Terminal 1 — start the API with your key
-$env:OPENAI_API_KEY = "sk-..."
-uvicorn app:app
+## Kafka topic layout
 
-# Terminal 2 — record 5s from default mic, upload, poll, print
-python record_and_transcribe.py                 # 5s default
-python record_and_transcribe.py --seconds 15    # longer clip
-```
+| Topic | Partitions | Key | Purpose |
+|---|---|---|---|
+| `transcriptions.submitted` | 32 | `user_id` | New jobs; workers consume with `enable_auto_commit=false` and commit only after successful write to Postgres + S3 |
 
-The script records 16 kHz mono WAV, POSTs it to `/v1/transcriptions`, polls until `done`, and prints timestamped segments.
+Partitioning by `user_id` gives per-user ordering (a user's jobs process in submit order) and fair fan-out across the worker pool.
+
+## Files
+
+| File | Role |
+|---|---|
+| [`app.py`](app.py) | FastAPI app: endpoints, auth, rate-limit deps, in-memory fallback |
+| [`worker.py`](worker.py) | Kafka consumer → Whisper → Postgres |
+| [`db.py`](db.py) | asyncpg pool + query helpers |
+| [`auth.py`](auth.py) | API key generation + hashing |
+| [`ratelimit.py`](ratelimit.py) | Redis sliding-window Lua + idempotency `SET NX EX` |
+| [`kqueue.py`](kqueue.py) | aiokafka producer/consumer |
+| [`transcribe.py`](transcribe.py) | Whisper + mock transcribers |
+| [`seed.py`](seed.py) | Create user + API key |
+| [`schema.sql`](schema.sql) | Postgres DDL |
+| [`docker-compose.yml`](docker-compose.yml) | Postgres 16 + Redis 7 + Kafka 3.7 (KRaft) |
+| [`openapi.json`](openapi.json) | Committed OpenAPI 3.1 spec |
+| [`export_openapi.py`](export_openapi.py) | Regenerate the spec |
+| [`test_api.py`](test_api.py) | 13 tests (in-memory mode, no infra needed) |
+
+## Interactive docs
+
+- `http://localhost:8000/docs` — Swagger UI
+- `http://localhost:8000/redoc` — ReDoc
+- `http://localhost:8000/openapi.json` — raw spec (feed to `openapi-generator` for typed SDKs)
 
 ## Test
 
 ```bash
-pip install pytest
+pip install pytest pytest-asyncio
 pytest -v
 ```
 
-### Coverage
-
-| Test | What it proves |
-|---|---|
-| `test_full_flow` | Submit → poll → fetch happy path |
-| `test_rejects_non_audio` | Non-audio uploads → `400` before any job is created |
-| `test_accepts_many_formats` | mp3 / m4a / flac / ogg / opus / webm all accepted |
-| `test_idempotency` | Same `Idempotency-Key` returns the same `job_id` |
-| `test_missing_job` | Unknown id → `404` on both poll and fetch |
-| `test_failed_job_surfaces_error` | Worker exception → `status: failed` with typed `error.code`, `error.message`, `error.retryable` on the poll response |
-| `test_fetch_before_done_returns_409` | Fetching before processing finishes returns `409` with the current status — never a partial or fake transcript |
-| `test_content_hash_dedup_without_key` | Two submits of identical bytes with no `Idempotency-Key` collapse to one job via content hash |
-| `test_concurrent_submits_collapse_to_one_job` | 5 threads racing the same `Idempotency-Key` produce exactly one job — the `LOCK` around the dedup table holds under contention |
-| `test_auth_disabled_when_no_env` | No `API_KEY` set → all requests accepted (dev mode) |
-| `test_auth_requires_bearer_when_key_set` | `API_KEY` set + missing Authorization header → `401` |
-| `test_auth_rejects_wrong_key` | Wrong bearer token → `401` |
-| `test_auth_accepts_correct_key` | Correct bearer token → `202` |
+13 tests cover: happy path, format validation, format acceptance, idempotency (header + content-hash), missing job, failure surfacing, early fetch → 409, auth (disabled/missing/wrong/correct), concurrent race dedup.
