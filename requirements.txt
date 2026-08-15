@@ -10,6 +10,7 @@ numpy>=1.26
 asyncpg>=0.29
 redis>=5.0
 aiokafka>=0.11
+prometheus-client>=0.20
 
 # Test
 pytest>=8.0

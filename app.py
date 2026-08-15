@@ -22,10 +22,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
+
+import metrics
 
 
 STORAGE = Path(__file__).parent / "storage"
@@ -76,6 +79,41 @@ app = FastAPI(
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    endpoint = request.url.path
+    if endpoint == "/metrics":
+        return await call_next(request)
+    metrics.http_requests_inflight.labels(endpoint=endpoint).inc()
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        status = 500
+        raise
+    finally:
+        elapsed = time.perf_counter() - start
+        metrics.http_requests_inflight.labels(endpoint=endpoint).dec()
+        metrics.http_request_duration_seconds.labels(
+            method=request.method, endpoint=endpoint
+        ).observe(elapsed)
+        metrics.http_requests_total.labels(
+            method=request.method, endpoint=endpoint, status=str(status)
+        ).inc()
+    return response
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"ok": True}
+
+
 # ---------- Schemas ----------
 
 class JobStatus(str, Enum):
@@ -122,18 +160,22 @@ async def authenticate(
         expected = os.environ.get("API_KEY")
         if expected:
             if creds is None or creds.scheme.lower() != "bearer":
+                metrics.auth_failures_total.labels(reason="missing").inc()
                 raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
             import hmac
             if not hmac.compare_digest(creds.credentials, expected):
+                metrics.auth_failures_total.labels(reason="invalid").inc()
                 raise HTTPException(401, "invalid api key", headers={"WWW-Authenticate": "Bearer"})
         return {"user_id": 0, "plan": "free", "email": "dev@local"}
 
     if creds is None or creds.scheme.lower() != "bearer":
+        metrics.auth_failures_total.labels(reason="missing").inc()
         raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
 
     import db
     user = await db.lookup_key(creds.credentials)
     if user is None:
+        metrics.auth_failures_total.labels(reason="invalid").inc()
         raise HTTPException(401, "invalid api key", headers={"WWW-Authenticate": "Bearer"})
     return user
 
@@ -154,6 +196,7 @@ def rate_limited(dimension: str):
         user_id, plan = _user_tuple(user)
         d = await ratelimit.check(user_id, plan, dimension)
         if not d.allowed:
+            metrics.rate_limit_rejections_total.labels(endpoint=dimension, plan=plan).inc()
             retry_s = max(1, d.window_ms // 1000)
             raise HTTPException(
                 429,
@@ -172,8 +215,11 @@ def rate_limited(dimension: str):
 
 def _inmemory_process(job_id: str, audio_path: Path) -> None:
     import json
+    metrics.jobs_in_flight.inc()
     with _LOCK:
+        queued_at = _JOBS[job_id].get("queued_at", time.time())
         _JOBS[job_id]["status"] = "processing"
+    started = time.perf_counter()
     try:
         if os.environ.get("OPENAI_API_KEY"):
             from transcribe import _whisper
@@ -182,15 +228,23 @@ def _inmemory_process(job_id: str, audio_path: Path) -> None:
             time.sleep(0.2)
             from transcribe import _mock
             segments = _mock(audio_path)
+        metrics.worker_transcribe_seconds.observe(time.perf_counter() - started)
         transcript_path = STORAGE / f"{job_id}.json"
         transcript_path.write_text(json.dumps({"segments": segments}))
         with _LOCK:
             _JOBS[job_id]["status"] = "done"
             _JOBS[job_id]["transcript_path"] = str(transcript_path)
+        metrics.jobs_completed_total.labels(status="done").inc()
+        metrics.job_duration_seconds.labels(status="done").observe(time.time() - queued_at)
     except Exception as e:
         with _LOCK:
             _JOBS[job_id]["status"] = "failed"
             _JOBS[job_id]["error"] = {"code": type(e).__name__, "message": str(e), "retryable": True}
+        metrics.jobs_completed_total.labels(status="failed").inc()
+        metrics.job_duration_seconds.labels(status="failed").observe(time.time() - queued_at)
+        metrics.whisper_errors_total.labels(error_code=type(e).__name__).inc()
+    finally:
+        metrics.jobs_in_flight.dec()
 
 
 # ---------- Endpoints ----------
@@ -213,12 +267,14 @@ async def submit(
         with _LOCK:
             if idem_key in _IDEMPOTENCY:
                 existing = _IDEMPOTENCY[idem_key]
+                metrics.jobs_dedup_hits_total.labels(plan="free").inc()
                 return {"job_id": existing, "status": _JOBS[existing]["status"]}
             job_id = str(uuid.uuid4())
             audio_path = STORAGE / f"{job_id}{ext or '.bin'}"
             audio_path.write_bytes(data)
-            _JOBS[job_id] = {"status": "queued", "audio_path": str(audio_path)}
+            _JOBS[job_id] = {"status": "queued", "audio_path": str(audio_path), "queued_at": time.time()}
             _IDEMPOTENCY[idem_key] = job_id
+        metrics.jobs_submitted_total.labels(plan="free").inc()
         threading.Thread(target=_inmemory_process, args=(job_id, audio_path), daemon=True).start()
         return {"job_id": job_id, "status": "queued"}
 
@@ -228,6 +284,7 @@ async def submit(
     fresh_id = str(uuid.uuid4())
     stored_id = await ratelimit.idempotency_lookup_or_set(user_id, idem_key, fresh_id)
     if stored_id != fresh_id:
+        metrics.jobs_dedup_hits_total.labels(plan=_user_tuple(user)[1]).inc()
         job = await db.get_job(uuid.UUID(stored_id), user_id)
         if job:
             return {"job_id": stored_id, "status": job["status"]}
@@ -243,6 +300,7 @@ async def submit(
             return {"job_id": str(winner), "status": job["status"] if job else "queued"}
         raise
     await kqueue.publish_job(fresh_id, user_id)
+    metrics.jobs_submitted_total.labels(plan=_user_tuple(user)[1]).inc()
     return {"job_id": fresh_id, "status": "queued"}
 
 

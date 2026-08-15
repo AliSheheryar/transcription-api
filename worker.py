@@ -7,12 +7,17 @@ the message and the worker picks it back up.
 """
 import asyncio
 import json
+import os
 import signal
+import time
 import uuid
 from pathlib import Path
 
+from prometheus_client import start_http_server
+
 import db
 import kqueue
+import metrics
 import transcribe
 
 
@@ -32,19 +37,32 @@ async def process_one(payload: dict) -> None:
 
     audio_path = Path(job["audio_path"])
     await db.set_job_processing(job_id)
+    metrics.jobs_in_flight.inc()
+    started = time.perf_counter()
     print(f"[worker] processing {job_id} ({audio_path.name})")
     try:
         segments = await transcribe.transcribe(audio_path)
+        metrics.worker_transcribe_seconds.observe(time.perf_counter() - started)
         transcript_path = STORAGE / f"{job_id}.json"
         transcript_path.write_text(json.dumps({"segments": segments}))
         await db.set_job_done(job_id, str(transcript_path))
+        metrics.jobs_completed_total.labels(status="done").inc()
+        metrics.job_duration_seconds.labels(status="done").observe(time.perf_counter() - started)
         print(f"[worker] done {job_id}")
     except Exception as e:
         await db.set_job_failed(job_id, type(e).__name__, str(e), retryable=True)
+        metrics.jobs_completed_total.labels(status="failed").inc()
+        metrics.job_duration_seconds.labels(status="failed").observe(time.perf_counter() - started)
+        metrics.whisper_errors_total.labels(error_code=type(e).__name__).inc()
         print(f"[worker] failed {job_id}: {type(e).__name__}: {e}")
+    finally:
+        metrics.jobs_in_flight.dec()
 
 
 async def main() -> None:
+    metrics_port = int(os.environ.get("WORKER_METRICS_PORT", "9100"))
+    start_http_server(metrics_port)
+    print(f"[worker] metrics on :{metrics_port}/metrics")
     await db.init_pool()
     stop = asyncio.Event()
 

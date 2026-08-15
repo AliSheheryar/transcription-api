@@ -1,0 +1,113 @@
+{
+  "title": "Transcription API",
+  "uid": "transcription-api",
+  "schemaVersion": 38,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {"from": "now-1h", "to": "now"},
+  "tags": ["transcription", "api"],
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Requests / sec",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(rate(http_requests_total[1m]))", "legendFormat": "rps"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Error rate (5xx)",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "thresholds": {"mode": "absolute", "steps": [
+        {"color": "green", "value": null}, {"color": "orange", "value": 0.01}, {"color": "red", "value": 0.05}
+      ]}}},
+      "targets": [{"expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_total[5m])), 1)"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "In-flight jobs",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "sum(jobs_in_flight)"}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Jobs / min (submitted)",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "sum(rate(jobs_submitted_total[1m])) * 60"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "HTTP request rate by endpoint",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{"expr": "sum by (endpoint) (rate(http_requests_total[1m]))", "legendFormat": "{{endpoint}}"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "HTTP status codes",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{"expr": "sum by (status) (rate(http_requests_total[1m]))", "legendFormat": "{{status}}"}]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "Request latency (P50 / P95 / P99)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "Latency by endpoint (P95)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket[5m])))", "legendFormat": "{{endpoint}}"}]
+    },
+    {
+      "id": 30, "type": "timeseries", "title": "Job throughput",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {"expr": "sum by (plan) (rate(jobs_submitted_total[1m]))", "legendFormat": "submitted {{plan}}"},
+        {"expr": "sum by (status) (rate(jobs_completed_total[1m]))", "legendFormat": "completed {{status}}"}
+      ]
+    },
+    {
+      "id": 31, "type": "timeseries", "title": "Job duration (queue → terminal)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le, status) (rate(job_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{status}}"},
+        {"expr": "histogram_quantile(0.95, sum by (le, status) (rate(job_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{status}}"}
+      ]
+    },
+    {
+      "id": 40, "type": "timeseries", "title": "Whisper latency (transcribe time)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(worker_transcribe_seconds_bucket[5m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(worker_transcribe_seconds_bucket[5m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(worker_transcribe_seconds_bucket[5m])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 41, "type": "timeseries", "title": "Whisper errors",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "targets": [{"expr": "sum by (error_code) (rate(whisper_errors_total[5m]))", "legendFormat": "{{error_code}}"}]
+    },
+    {
+      "id": 50, "type": "timeseries", "title": "Auth failures",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
+      "targets": [{"expr": "sum by (reason) (rate(auth_failures_total[5m]))", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "id": 51, "type": "timeseries", "title": "Rate-limit rejections (429)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
+      "targets": [{"expr": "sum by (endpoint, plan) (rate(rate_limit_rejections_total[5m]))", "legendFormat": "{{endpoint}} / {{plan}}"}]
+    },
+    {
+      "id": 60, "type": "timeseries", "title": "Dedup hits (idempotency working)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 44},
+      "targets": [{"expr": "sum by (plan) (rate(jobs_dedup_hits_total[5m]))", "legendFormat": "{{plan}}"}]
+    },
+    {
+      "id": 61, "type": "timeseries", "title": "In-flight requests by endpoint",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 44},
+      "targets": [{"expr": "sum by (endpoint) (http_requests_inflight)", "legendFormat": "{{endpoint}}"}]
+    }
+  ]
+}

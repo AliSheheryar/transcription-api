@@ -130,6 +130,43 @@ Partitioning by `user_id` gives per-user ordering (a user's jobs process in subm
 | [`export_openapi.py`](export_openapi.py) | Regenerate the spec |
 | [`test_api.py`](test_api.py) | 13 tests (in-memory mode, no infra needed) |
 
+## Monitoring — Prometheus + Grafana
+
+Every API and worker instance exposes Prometheus metrics; docker-compose ships a pre-configured Prometheus scrape target and a Grafana dashboard.
+
+### Endpoints
+- API metrics:    `http://localhost:8000/metrics`
+- Worker metrics: `http://localhost:9100/metrics`
+- Prometheus:     `http://localhost:9090`
+- Grafana:        `http://localhost:3000` (anonymous viewer; admin/admin to edit)
+
+### What's tracked
+| Category | Metric | Labels |
+|---|---|---|
+| HTTP | `http_requests_total`, `http_request_duration_seconds`, `http_requests_inflight` | method, endpoint, status |
+| Auth | `auth_failures_total` | reason (`missing`\|`invalid`) |
+| Rate limit | `rate_limit_rejections_total` | endpoint, plan |
+| Jobs | `jobs_submitted_total`, `jobs_dedup_hits_total`, `jobs_completed_total`, `jobs_in_flight` | plan, status |
+| Latency | `job_duration_seconds` (queue → terminal), `worker_transcribe_seconds` (Whisper call) | status |
+| Upstream | `whisper_errors_total` | error_code |
+
+### Dashboard panels (auto-provisioned)
+Row 1 — RPS · error rate · in-flight jobs · jobs/min
+Row 2 — request rate by endpoint · status codes
+Row 3 — latency P50/P95/P99 · latency by endpoint (P95)
+Row 4 — job throughput · job duration (queue → done)
+Row 5 — Whisper latency · Whisper errors
+Row 6 — auth failures · 429 rejections
+Row 7 — dedup hits · in-flight requests by endpoint
+
+Dashboard JSON: [`monitoring/grafana/dashboards/transcription-api.json`](monitoring/grafana/dashboards/transcription-api.json)
+
+### Bring it up
+```bash
+docker compose up -d
+# Grafana → http://localhost:3000  (dashboard auto-loads under "Transcription API")
+```
+
 ## Interactive docs
 
 - `http://localhost:8000/docs` — Swagger UI
