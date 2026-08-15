@@ -15,7 +15,7 @@ def _whisper(audio_path: Path) -> list[dict]:
             timestamp_granularities=["segment"],
         )
     return [
-        {"start": s["start"], "end": s["end"], "text": s["text"].strip()}
+        {"start": s.start, "end": s.end, "text": s.text.strip()}
         for s in (result.segments or [])
     ]
 

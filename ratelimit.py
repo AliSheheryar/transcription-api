@@ -118,3 +118,12 @@ async def idempotency_lookup_or_set(user_id: int, key: str, job_id: str, ttl_sec
         return job_id
     existing = await _client.get(ikey)
     return existing or job_id
+
+
+async def idempotency_force_set(user_id: int, key: str, job_id: str, ttl_seconds: int = 86_400) -> None:
+    """Overwrite the idempotency mapping. Used to repair a stale Redis entry
+    after we learn the true DB owner of the idem_key from a race."""
+    if _client is None:
+        await init()
+    assert _client is not None
+    await _client.set(f"idem:{user_id}:{key}", job_id, ex=ttl_seconds)

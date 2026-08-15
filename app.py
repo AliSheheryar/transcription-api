@@ -293,12 +293,20 @@ async def submit(
     try:
         await db.insert_job(uuid.UUID(fresh_id), user_id, str(audio_path), idem_key)
     except Exception:
-        # Race: another submit won; fetch the winner
+        # Race: another submit won; fetch the true winner and repair Redis
         winner = await db.get_job_id_by_idempotency(user_id, idem_key)
+        try:
+            audio_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         if winner:
+            await ratelimit.idempotency_force_set(user_id, idem_key, str(winner))
             job = await db.get_job(winner, user_id)
             return {"job_id": str(winner), "status": job["status"] if job else "queued"}
         raise
+    # If we fell through here after stored_id != fresh_id, Redis is stale — repair it
+    if stored_id != fresh_id:
+        await ratelimit.idempotency_force_set(user_id, idem_key, fresh_id)
     await kqueue.publish_job(fresh_id, user_id)
     metrics.jobs_submitted_total.labels(plan=_user_tuple(user)[1]).inc()
     return {"job_id": fresh_id, "status": "queued"}
