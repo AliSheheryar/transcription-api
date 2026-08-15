@@ -2,6 +2,50 @@
 
 Async audio transcription API with submit / poll / fetch endpoints. Accepts any common audio format (mp3, wav, m4a, flac, ogg, opus, webm, aac, wma, aiff, amr, 3gp, mka). Uses OpenAI Whisper when `OPENAI_API_KEY` is set, otherwise returns a mock transcript so tests and local dev work without an API key.
 
+## Design
+
+**Approach.** The naive `POST /transcribe → wait → return text` breaks the moment transcription takes more than a few seconds: clients time out, retries duplicate work, crashes lose jobs. So it's **async**: submit returns immediately, work happens in the background, client polls.
+
+**Key decisions.**
+1. **Three endpoints, not one** — submit / poll / fetch. Poll stays cheap (tiny status blob); fetch ships the full transcript only once.
+2. **State machine in durable storage** — `queued → processing → done | failed`. Every component reads the same row; nothing calls anything else directly.
+3. **Idempotency-Key + content-hash fallback** — retries collapse to one job, so a flaky network never double-charges.
+4. **Failures written into the job row** — worker exception becomes `{code, message, retryable}` on the next poll; nothing disappears silently.
+5. **Whisper swappable behind one function** — real call when `OPENAI_API_KEY` is set, mock otherwise. Tests + local dev need no key.
+6. **Format check is loose** — extension OR `audio/*` mime. Whisper decides if the bytes are actually audio.
+
+**End-to-end flow.**
+
+```
+CLIENT                     API                           WORKER                    STORAGE
+  │                         │                              │                          │
+  │  POST audio ──────────▶ │                              │                          │
+  │                         │ validate format (400 if bad) │                          │
+  │                         │ compute idempotency key      │                          │
+  │                         │ ┌─ LOCK ─────────────────┐   │                          │
+  │                         │ │ key seen? → return id  │   │                          │
+  │                         │ │ else: mint UUID,       │   │                          │
+  │                         │ │   write audio blob ────┼──────────────────────────▶  │
+  │                         │ │   JOBS[id]=queued      │   │                          │
+  │                         │ └────────────────────────┘   │                          │
+  │                         │ start background thread ────▶│                          │
+  │ ◀── 202 { job_id } ─────│                              │ status: processing       │
+  │                         │                              │ read audio ◀────────────│
+  │                         │                              │ call Whisper (or mock)   │
+  │                         │                              │ write transcript.json ──▶│
+  │                         │                              │ status: done             │
+  │                         │                              │ (on error → failed +     │
+  │                         │                              │  {code, msg, retryable}) │
+  │  GET /{id} ───────────▶ │ read JOBS[id] under lock     │                          │
+  │ ◀── {status} ───────────│                              │                          │
+  │        ...poll...       │                              │                          │
+  │  GET /{id}/transcript ▶ │ if not done → 409            │                          │
+  │                         │ else read blob ◀─────────────────────────────────────── │
+  │ ◀── { segments } ───────│                              │                          │
+```
+
+**The one principle.** Every layer talks only through the job row. That's what lets the dict become Postgres, the thread become a queue, and the local file become S3 — with the endpoints unchanged.
+
 ## Install
 
 ```bash
