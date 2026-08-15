@@ -6,7 +6,7 @@ client = TestClient(app)
 
 
 def test_full_flow():
-    files = {"file": ("sample.mp3", b"ID3fake-mp3-bytes", "audio/mpeg")}
+    files = {"file": ("sample.wav", b"RIFFfake-wav-bytes", "audio/wav")}
     r = client.post("/v1/transcriptions", files=files)
     assert r.status_code == 202
     job_id = r.json()["job_id"]
@@ -27,16 +27,29 @@ def test_full_flow():
     assert len(r.json()["segments"]) == 2
 
 
-def test_rejects_non_mp3():
-    files = {"file": ("x.wav", b"data", "audio/wav")}
+def test_rejects_non_audio():
+    files = {"file": ("x.txt", b"data", "text/plain")}
     r = client.post("/v1/transcriptions", files=files)
     assert r.status_code == 400
 
 
+def test_accepts_many_formats():
+    for name, mime in [
+        ("a.mp3", "audio/mpeg"),
+        ("a.m4a", "audio/mp4"),
+        ("a.flac", "audio/flac"),
+        ("a.ogg", "audio/ogg"),
+        ("a.opus", "audio/opus"),
+        ("a.webm", "audio/webm"),
+    ]:
+        r = client.post("/v1/transcriptions", files={"file": (name, b"x", mime)})
+        assert r.status_code == 202, f"{name} rejected"
+
+
 def test_idempotency():
-    files = {"file": ("a.mp3", b"same-bytes", "audio/mpeg")}
+    files = {"file": ("a.flac", b"same-bytes", "audio/flac")}
     r1 = client.post("/v1/transcriptions", files=files, headers={"Idempotency-Key": "k1"})
-    files = {"file": ("a.mp3", b"same-bytes", "audio/mpeg")}
+    files = {"file": ("a.flac", b"same-bytes", "audio/flac")}
     r2 = client.post("/v1/transcriptions", files=files, headers={"Idempotency-Key": "k1"})
     assert r1.json()["job_id"] == r2.json()["job_id"]
 
@@ -47,7 +60,8 @@ def test_missing_job():
 
 if __name__ == "__main__":
     test_full_flow()
-    test_rejects_non_mp3()
+    test_rejects_non_audio()
+    test_accepts_many_formats()
     test_idempotency()
     test_missing_job()
     print("all tests passed")
