@@ -46,8 +46,6 @@ CLIENT                     API                           WORKER                 
 
 **The one principle.** Every layer talks only through the job row. That's what lets the dict become Postgres, the thread become a queue, and the local file become S3 — with the endpoints unchanged.
 
-> **Production architecture** — see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the target design: **Kafka** as the durable job queue, **Redis** for rate limiting (sliding-window Lua) and idempotency, a **3-state circuit breaker** + **bulkheads** around Whisper, the **outbox pattern** for exactly-once produce, and DLQ / poison-pill handling.
-
 ## Install
 
 ```bash
