@@ -2,6 +2,8 @@
 
 Async, multi-user audio transcription API. Postgres for state, Redis for rate limiting + idempotency, Kafka for the job queue, worker as a separate process. Falls back to an in-memory mode for CI/dev without any infrastructure.
 
+> **The "why" behind every choice** lives in [`DESIGN.md`](DESIGN.md) — problem framing, stack decisions with alternatives considered, multi-tenancy model, idempotency race handling, failure modes, trade-offs, and what we deliberately didn't build.
+
 ## Architecture
 
 ```mermaid
