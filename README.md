@@ -4,22 +4,47 @@ Async, multi-user audio transcription API. Postgres for state, Redis for rate li
 
 ## Architecture
 
-```
-┌───────┐   POST audio        ┌──────────┐   produce         ┌─────────┐
-│Client │ ───────────────────▶│ FastAPI  │──────────────────▶│ Kafka   │
-│       │                     │  (API)   │                    │(topic:  │
-│       │ ◀── 202 {job_id} ───│          │                    │submits) │
-└───────┘                     │          │                    └────┬────┘
-                              │   auth ─▶│ Postgres:                │
-                              │   rate ─▶│  users, api_keys, jobs   │ consume
-                              │   idem ─▶│ Redis: rl + idempotency  ▼
-                              └──────────┘                    ┌──────────┐
-     GET status/transcript                                    │  Worker  │
-       ───────────────────────────────────────────────────────│(consumer)│
-                                                              │→ Whisper │
-                                                              │→ update  │
-                                                              │  Postgres│
-                                                              └──────────┘
+```mermaid
+flowchart TD
+    Client[Client]
+    API[FastAPI API]
+    Auth{Auth: lookup API key}
+    Rate{Rate limit: sliding window}
+    Idem{Idempotency: SET NX EX}
+    InsertJob[Insert job row: status=queued]
+    Publish[Publish to Kafka]
+    Kafka[(Kafka topic:<br/>transcriptions.submitted)]
+    Worker[Worker: consume]
+    SetProcessing[Update Postgres: status=processing]
+    Whisper[Call OpenAI Whisper]
+    WriteResult[Write transcript JSON to storage]
+    SetDone[Update Postgres: status=done]
+    Postgres[(Postgres:<br/>users, api_keys, jobs)]
+    Redis[(Redis:<br/>rate-limit + idempotency)]
+
+    Client -->|POST audio| API
+    API --> Auth
+    Auth -->|hash lookup| Postgres
+    Auth --> Rate
+    Rate -->|Lua script| Redis
+    Rate --> Idem
+    Idem -->|dedup| Redis
+    Idem --> InsertJob
+    InsertJob --> Postgres
+    InsertJob --> Publish
+    Publish --> Kafka
+    API -->|202 job_id| Client
+
+    Kafka --> Worker
+    Worker --> SetProcessing
+    SetProcessing --> Postgres
+    SetProcessing --> Whisper
+    Whisper --> WriteResult
+    WriteResult --> SetDone
+    SetDone --> Postgres
+
+    Client -->|GET status / transcript| API
+    API -->|read job row| Postgres
 ```
 
 ## Modes
