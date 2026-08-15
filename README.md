@@ -8,19 +8,23 @@ Async, multi-user audio transcription API. Postgres for state, Redis for rate li
 flowchart TD
     Client[Client]
     API[API]
-    Postgres[(Postgres)]
     Redis[(Redis)]
+    Postgres[(Postgres)]
     Kafka[(Kafka)]
     Worker[Worker]
     Whisper[Whisper]
 
-    Client --> API
-    API --> Postgres
-    API --> Redis
-    API --> Kafka
-    Kafka --> Worker
-    Worker --> Whisper
-    Worker --> Postgres
+    Client -->|audio upload / poll / fetch| API
+    API -->|202 job_id / status / transcript| Client
+    API -->|check rate limit + idempotency| Redis
+    Redis -->|allow / deny| API
+    API -->|insert / read job| Postgres
+    Postgres -->|job row| API
+    API -->|publish job_id| Kafka
+    Kafka -->|consume job| Worker
+    Worker -->|send audio| Whisper
+    Whisper -->|return transcript| Worker
+    Worker -->|update status / save transcript| Postgres
 ```
 
 ## Modes
